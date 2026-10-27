@@ -1,0 +1,62 @@
+# TEMPORARY diagnostic: runs an already-built CropDog-Setup from a previous
+# "Windows app" run's artifact with every observation that matters, to find
+# where a silent install goes. Delete once the install-test job is green.
+name: Install probe
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Windows app run id whose artifact to probe"
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - name: Fetch the artifact of that run
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download ${{ inputs.run_id }} --repo ${{ github.repository }} -n CropDog-${{ inputs.version }}-win -D new
+          Get-ChildItem new | ForEach-Object { "$($_.Name) $($_.Length)" }
+      - name: Silent install with diagnostics
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path "new/CropDog-Setup-${{ inputs.version }}.exe").Path
+          $guid = "bbaad8a5-704e-4315-b7e7-d2d472f2a539"
+          "LOCALAPPDATA=$env:LOCALAPPDATA  APPDATA=$env:APPDATA  TEMP=$env:TEMP  USERPROFILE=$env:USERPROFILE"
+          "User Shell Folders:"; Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" | Format-List | Out-String -Width 200
+          "--- before: HKCU\Software\$guid exists: $(Test-Path "HKCU:\Software\$guid")"
+          $t0 = Get-Date
+          $p = Start-Process -FilePath $setup -ArgumentList "/S" -Wait -PassThru
+          "/S exit $($p.ExitCode) after $([int]((Get-Date) - $t0).TotalSeconds) s"
+          "--- after: HKCU\Software\$guid:"; Get-ItemProperty "HKCU:\Software\$guid" -ErrorAction SilentlyContinue | Format-List | Out-String -Width 200
+          "--- after: uninstall key:"; Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$guid" -ErrorAction SilentlyContinue | Format-List | Out-String -Width 200
+          "--- $env:LOCALAPPDATA\Programs:"; Get-ChildItem "$env:LOCALAPPDATA\Programs" -ErrorAction SilentlyContinue | ForEach-Object { "  " + $_.FullName }
+          "--- search C:\ and D:\ for Uninstall CropDog.exe / CropDog.lnk / install.log:"
+          foreach ($root in @("C:\", "D:\")) {
+            Get-ChildItem -Path $root -Recurse -Force -ErrorAction SilentlyContinue -Include "Uninstall CropDog.exe","CropDog.lnk","CropDog.exe" | Where-Object { $_.FullName -notmatch '\\new\\' } | ForEach-Object { "  " + $_.FullName + "  " + $_.Length }
+          }
+          "--- TEMP leftovers:"; Get-ChildItem $env:TEMP -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "ns*" } | ForEach-Object { "  " + $_.FullName }
+          "--- Application event log, last 3 minutes, errors/warnings:"
+          Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-3); Level=1,2,3} -ErrorAction SilentlyContinue | Select-Object -First 15 TimeCreated, ProviderName, Id, Message | Format-List | Out-String -Width 220
+      - name: Non-silent run (one-click UI), 120 s, then look again
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path "new/CropDog-Setup-${{ inputs.version }}.exe").Path
+          $t0 = Get-Date
+          $p = Start-Process -FilePath $setup -PassThru
+          for ($i = 0; $i -lt 60; $i++) { Start-Sleep -Seconds 2; if ($p.HasExited) { break } }
+          "non-silent: exited=$($p.HasExited) code=$($p.ExitCode) after $([int]((Get-Date) - $t0).TotalSeconds) s"
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          Get-Process -Name CropDog -ErrorAction SilentlyContinue | ForEach-Object { "CropDog process running: $($_.Path)"; Stop-Process -Id $_.Id -Force }
+          "--- $env:LOCALAPPDATA\Programs:"; Get-ChildItem "$env:LOCALAPPDATA\Programs" -ErrorAction SilentlyContinue | ForEach-Object { "  " + $_.FullName }
+          $dir = "$env:LOCALAPPDATA\Programs\CropDog"
+          if (Test-Path $dir) { "--- $dir has $((Get-ChildItem $dir -Recurse -File).Count) files"; Get-ChildItem $dir | ForEach-Object { "  " + $_.Name } }
