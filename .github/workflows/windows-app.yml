@@ -424,15 +424,20 @@ jobs:
           $app = Start-Process -FilePath "$dir\CropDog.exe" -PassThru -WorkingDirectory $dir
           Start-Sleep -Seconds 20
           $alive = Get-Process -Id $app.Id -ErrorAction SilentlyContinue
-          $log = "$env:APPDATA\CropDog\startup.log"
-          "process alive after 20 s: $([bool]$alive); startup.log present: $(Test-Path $log)"
-          if (Test-Path $log) { Get-Content $log | Select-Object -First 12 }
+          # A healthy launch writes network.log (the manifest GET at startup) in the
+          # app's data folder; startup.log exists ONLY when startup failed (main.js
+          # writes it from its error handler), so its presence is the failure.
+          $net = "$env:APPDATA\CropDog\network.log"
+          $fail = "$env:APPDATA\CropDog\startup.log"
+          "process alive after 20 s: $([bool]$alive); network.log present: $(Test-Path $net); startup.log (failure) present: $(Test-Path $fail)"
+          if (Test-Path $fail) { Get-Content $fail | Select-Object -First 20; throw "the app recorded a startup failure" }
+          if (Test-Path $net) { Get-Content $net | Select-Object -First 6 }
           if (-not $alive) { throw "CropDog.exe did not stay running" }
-          if (-not (Test-Path $log)) { throw "the app wrote no startup.log — it did not start" }
+          if (-not (Test-Path $net)) { throw "the app wrote no network.log — it did not reach its startup manifest check" }
           Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
           Get-Process -Name CropDog -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 3
-          "launched from the installed copy: process ran, startup.log written" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "launched from the installed copy: process ran 20 s, network.log written, no startup failure" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       # The in-app update, INSIDE an installed folder: down to the shipped version
       # (the zip studios are on), then back up to this build — both with the real
