@@ -38,7 +38,7 @@ jobs:
           $t0 = Get-Date
           $p = Start-Process -FilePath $setup -ArgumentList "/S" -Wait -PassThru
           "/S exit $($p.ExitCode) after $([int]((Get-Date) - $t0).TotalSeconds) s"
-          "--- after: HKCU\Software\$guid:"; Get-ItemProperty "HKCU:\Software\$guid" -ErrorAction SilentlyContinue | Format-List | Out-String -Width 200
+          "--- after: HKCU\Software\${guid}:"; Get-ItemProperty "HKCU:\Software\$guid" -ErrorAction SilentlyContinue | Format-List | Out-String -Width 200
           "--- after: uninstall key:"; Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$guid" -ErrorAction SilentlyContinue | Format-List | Out-String -Width 200
           "--- $env:LOCALAPPDATA\Programs:"; Get-ChildItem "$env:LOCALAPPDATA\Programs" -ErrorAction SilentlyContinue | ForEach-Object { "  " + $_.FullName }
           "--- search C:\ and D:\ for Uninstall CropDog.exe / CropDog.lnk / install.log:"
