@@ -486,10 +486,9 @@ jobs:
 
       # A STANDARD user (Users group only, never Administrators) with a random
       # password that is never printed. The installer must need no elevation: the
-      # files land in that user's own %LocalAppData%\Programs. Two launch methods
-      # are tried, because a GitHub runner has no interactive session for a second
-      # user: first CreateProcessWithLogonW (Start-Process -Credential), then a
-      # scheduled task running as that user; whichever installs is reported.
+      # files land in that user's own %LocalAppData%\Programs. Launched with
+      # CreateProcessWithLogonW (Start-Process -Credential) and that user's own
+      # environment (see the note in the step).
       - name: Fresh install as a non-admin user (silent), check, uninstall
         shell: pwsh
         run: |
@@ -510,30 +509,24 @@ jobs:
           $home2 = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -ErrorAction SilentlyContinue).ProfileImagePath
           "profile of ${user}: $home2"
           $dir = "$home2\AppData\Local\Programs\CropDog"
-          $installed = $false
-          # Method 1: CreateProcessWithLogonW.
+          # CreateProcessWithLogonW gives the child the user's TOKEN but the CALLER's
+          # environment block, and Windows resolves the user's shell folders through
+          # %USERPROFILE% from that block — so without this the installer aims at
+          # runneradmin's folder (no write access) and fails silently with exit 0
+          # (builder run 40597856700). A real logon sets these itself; set them here.
+          $envp = "set USERPROFILE=$home2&& set HOMEDRIVE=C:&& set HOMEPATH=$($home2.Substring(2))&& set USERNAME=$user&& set APPDATA=$home2\AppData\Roaming&& set LOCALAPPDATA=$home2\AppData\Local&& set TEMP=$home2\AppData\Local\Temp&& set TMP=$home2\AppData\Local\Temp&& "
+          New-Item -ItemType Directory -Force -Path "$home2\AppData\Local\Temp" | Out-Null
+          Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList "/c $envp echo LOCALAPPDATA=%LOCALAPPDATA%" -Credential $cred -LoadUserProfile -Wait -RedirectStandardOutput "$T\env.txt" -WorkingDirectory $T
+          "as ${user} with its own environment: $(Get-Content "$T\env.txt" -Raw)"
           $t0 = Get-Date
-          $p = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList "/c `"$setup`" /S & echo installer-exit=%ERRORLEVEL%" -Credential $cred -LoadUserProfile -Wait -PassThru -RedirectStandardOutput "$T\inst1.txt" -RedirectStandardError "$T\inst1.err" -WorkingDirectory $T
-          "method 1 (CreateProcessWithLogonW): cmd exit $($p.ExitCode) after $([int]((Get-Date) - $t0).TotalSeconds) s; $(Get-Content "$T\inst1.txt" -Raw) $(Get-Content "$T\inst1.err" -Raw)"
-          if (Test-Path -LiteralPath "$dir\CropDog.exe") { $installed = $true; "method 1 installed to $dir" }
-          else {
-            "method 1 left nothing at $dir; CropDog.exe anywhere under C:\Users:"
+          $p = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList "/c $envp `"$setup`" /S & echo installer-exit=%ERRORLEVEL%" -Credential $cred -LoadUserProfile -Wait -PassThru -RedirectStandardOutput "$T\inst1.txt" -RedirectStandardError "$T\inst1.err" -WorkingDirectory $T
+          "installer as ${user}: cmd exit $($p.ExitCode) after $([int]((Get-Date) - $t0).TotalSeconds) s; $(Get-Content "$T\inst1.txt" -Raw) $(Get-Content "$T\inst1.err" -Raw)"
+          $installed = Test-Path -LiteralPath "$dir\CropDog.exe"
+          if (-not $installed) {
+            "nothing at $dir; CropDog.exe anywhere under C:\Users:"
             Get-ChildItem -Path C:\Users -Recurse -Filter CropDog.exe -ErrorAction SilentlyContinue | ForEach-Object { "  " + $_.FullName }
-            # Method 2: a scheduled task running as that user (a real logon session).
-            $act = New-ScheduledTaskAction -Execute $setup -Argument "/S" -WorkingDirectory $T
-            $task = Register-ScheduledTask -TaskName "cropdog-install" -Action $act -User $user -Password $plain -RunLevel Limited -Force
-            Start-ScheduledTask -TaskName "cropdog-install"
-            for ($i = 0; $i -lt 180; $i++) { Start-Sleep -Seconds 2; if ((Get-ScheduledTask -TaskName "cropdog-install").State -ne "Running") { break } }
-            $info = Get-ScheduledTaskInfo -TaskName "cropdog-install"
-            "method 2 (scheduled task as ${user}): last result $($info.LastTaskResult), state $((Get-ScheduledTask -TaskName 'cropdog-install').State)"
-            Unregister-ScheduledTask -TaskName "cropdog-install" -Confirm:$false
-            if (Test-Path -LiteralPath "$dir\CropDog.exe") { $installed = $true; "method 2 installed to $dir" }
-            else {
-              "method 2 left nothing at $dir; CropDog.exe anywhere under C:\Users:"
-              Get-ChildItem -Path C:\Users -Recurse -Filter CropDog.exe -ErrorAction SilentlyContinue | ForEach-Object { "  " + $_.FullName }
-            }
           }
-          if (-not $installed) { throw "the installer did not install for the non-admin user ${user} by either method" }
+          if (-not $installed) { throw "the installer did not install for the non-admin user ${user}" }
           foreach ($f in @("$dir\CropDog.exe", "$dir\Uninstall CropDog.exe",
                            "$home2\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\CropDog.lnk", "$home2\Desktop\CropDog.lnk")) {
             if (-not (Test-Path -LiteralPath $f)) { throw "missing after install (${user}): $f" }
@@ -549,17 +542,9 @@ jobs:
           if (Test-Path "HKLM:\$env:ARP") { throw "the per-user installer wrote an HKLM uninstall entry" }
           "fresh install as non-admin ${user}: files, Start-menu + desktop shortcuts, Add/Remove entry ${{ inputs.version }}, no elevation" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           # Uninstall as that user, the same way it was installed.
-          $p = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList "/c `"$dir\Uninstall CropDog.exe`" /S" -Credential $cred -LoadUserProfile -Wait -PassThru -WorkingDirectory $T
+          $p = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList "/c $envp `"$dir\Uninstall CropDog.exe`" /S" -Credential $cred -LoadUserProfile -Wait -PassThru -WorkingDirectory $T
           "uninstaller (as ${user}) cmd exit $($p.ExitCode)"
-          Start-Sleep -Seconds 5
-          if (Test-Path -LiteralPath "$dir\CropDog.exe") {
-            $act = New-ScheduledTaskAction -Execute "$dir\Uninstall CropDog.exe" -Argument "/S" -WorkingDirectory $T
-            Register-ScheduledTask -TaskName "cropdog-uninstall" -Action $act -User $user -Password $plain -RunLevel Limited -Force | Out-Null
-            Start-ScheduledTask -TaskName "cropdog-uninstall"
-            for ($i = 0; $i -lt 90; $i++) { Start-Sleep -Seconds 2; if ((Get-ScheduledTask -TaskName "cropdog-uninstall").State -ne "Running") { break } }
-            Unregister-ScheduledTask -TaskName "cropdog-uninstall" -Confirm:$false
-            Start-Sleep -Seconds 5
-          }
+          Start-Sleep -Seconds 8
           foreach ($f in @($dir, "$home2\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\CropDog.lnk", "$home2\Desktop\CropDog.lnk")) {
             if (Test-Path -LiteralPath $f) { throw "left behind after uninstall (${user}): $f" }
           }
