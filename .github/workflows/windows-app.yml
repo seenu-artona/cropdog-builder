@@ -43,7 +43,8 @@
 # HOW IT AUTHENTICATES — no secret. `azure/login` exchanges this job's GitHub
 # OIDC token for an Azure sign-in through a FEDERATED CREDENTIAL on the Entra
 # app registration "cropdog-builder" (issuer token.actions.githubusercontent.com,
-# subject repo:seenu-artona/cropdog-builder:ref:refs/heads/main — so this
+# subject repo:seenu-artona@292234898/cropdog-builder@1436242924:ref:refs/heads/main
+# — the id-qualified form GitHub presents; the plain one is refused — so this
 # workflow signs only when run from `main` of THIS repo). The signing cmdlet then
 # finds that sign-in by itself (Azure's DefaultAzureCredential chain, its
 # AzureCliCredential step). The three values azure/login needs — tenant id,
