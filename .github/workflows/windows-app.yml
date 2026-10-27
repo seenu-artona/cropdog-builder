@@ -3,31 +3,39 @@
 # seenu-artona/crop-dog repo, checked out here with a read-only deploy key
 # (secret CROPDOG_DEPLOY_KEY); nothing of it lives in this repo. Run BY HAND
 # only, giving the version number. This is crop-dog's .github/workflows/
-# windows-app.yml (commit de5c786) with the checkout changed, plus two jobs after
-# the build: the real update swap and the five-photo box check.
+# windows-app.yml (commit de5c786) with the checkout changed, plus three jobs
+# after the build: the real update swap, the installer (install / launch / swap
+# inside the installed folder / uninstall), and the five-photo box check.
 #
-# THREE JOBS.
-#   build-app  — builds, signs CropDog.exe, verifies the signature twice, zips,
-#                and keeps the zip + its .json as a workflow ARTIFACT (7 days).
-#                With `publish: true` it ALSO publishes them as the pre-release
-#                desktop-v<version>-win in seenu-artona/cropdog-releases (needs
-#                the RELEASES_TOKEN secret in THIS repo — a fine-grained token
-#                scoped to the releases repo, Contents read/write). It never
-#                touches manifest.json: nothing reaches a studio until
-#                manifest.latestWin is written from the Mac (crop-dog's
-#                desktop/RELEASING.md). Without the secret, publish from the Mac
-#                with the downloaded artifact (RELEASING.md).
-#   swap-test  — the SHIPPED Windows app (manifest.latestWin, the version studios
-#                are on) is replaced in place by this build by the REAL swap.ps1,
-#                launched the way updater.js launches it (.github/scripts/
-#                swap-real-test.mjs in crop-dog). Proves the update installs.
-#   box-check  — the five standard photos (a PRIVATE branch of crop-dog, fetched
-#                at run time with the same deploy key; NEVER in this repo, NEVER
-#                uploaded as an artifact) are parsed on the Windows CPU runtime
-#                (fp32, what a PC without a supported GPU runs) and cropped by the
-#                same engine the app ships; the boxes must equal the Mac's
-#                (native/detect/golden/five-boxes-mac.json). Only the box numbers
-#                leave the runner, in the job summary.
+# FOUR JOBS.
+#   build-app    — builds, signs CropDog.exe, builds the per-user INSTALLER
+#                  (CropDog-Setup-<v>.exe, electron-builder NSIS from the same
+#                  packaged folder; its uninstaller and the installer are signed
+#                  by the same profile through a sign hook), verifies both
+#                  signatures with signtool, zips, and keeps zip + Setup + .json
+#                  as a workflow ARTIFACT (7 days). With `publish: true` it ALSO
+#                  publishes them as the pre-release desktop-v<version>-win in
+#                  seenu-artona/cropdog-releases (needs the RELEASES_TOKEN secret
+#                  in THIS repo). It never touches manifest.json: nothing reaches
+#                  a studio until manifest.latestWin is written from the Mac
+#                  (crop-dog's desktop/RELEASING.md). Without the secret, publish
+#                  from the Mac with the downloaded artifact (RELEASING.md).
+#   swap-test    — the SHIPPED Windows app (manifest.latestWin) is replaced in
+#                  place by this build by the REAL swap.ps1, launched the way
+#                  updater.js launches it (.github/scripts/swap-real-test.mjs).
+#   install-test — the installer, as a studio meets it: a fresh install as a
+#                  NON-ADMIN local user (silent), the files, both shortcuts and
+#                  the Add/Remove entry in place and no elevation; the app
+#                  launched from an installed copy; the real swap.ps1 run INSIDE
+#                  an installed folder (down to the shipped version, back up to
+#                  this one: the uninstaller survives, Add/Remove shows the new
+#                  version); then uninstall, leaving no files, shortcuts or entry.
+#   box-check    — the five standard photos (a PRIVATE branch of crop-dog, fetched
+#                  at run time with the same deploy key; NEVER in this repo, NEVER
+#                  uploaded as an artifact) are parsed on the Windows CPU runtime
+#                  (fp32) and cropped by the same engine the app ships; the boxes
+#                  must equal the Mac's (native/detect/golden/five-boxes-mac.json).
+#                  Only the box numbers leave the runner, in the job summary.
 #
 # CODE SIGNING — Azure Artifact Signing (Microsoft's name since 2026 for Trusted
 # Signing), configured in crop-dog's desktop/winsign.json and read by its
@@ -35,10 +43,12 @@
 # 2026-10-27: cropdog-public), build.mjs signs CropDog.exe with Microsoft's
 # PowerShell cmdlet (Invoke-ArtifactSigning: the same call electron-builder's
 # azureSignOptions makes), then verifies the signature is Valid, timestamped and
-# by the configured publisher; this job then re-verifies with the Windows SDK's
-# signtool. A build that fails any of those never reaches the artifact or the
-# publish step, so there is no silently unsigned build. (With no profile in
-# winsign.json the build is UNSIGNED and says so; the Azure steps are skipped.)
+# by the configured publisher; electron-builder's sign hook does the same for
+# the uninstaller and the installer; this job then re-verifies both files with
+# the Windows SDK's signtool. A build that fails any of those never reaches the
+# artifact or the publish step, so there is no silently unsigned build. (With no
+# profile in winsign.json the build is UNSIGNED and says so; the Azure steps are
+# skipped.)
 #
 # HOW IT AUTHENTICATES — no secret. `azure/login` exchanges this job's GitHub
 # OIDC token for an Azure sign-in through a FEDERATED CREDENTIAL on the Entra
@@ -58,7 +68,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to build, e.g. 1.2.24 (X.Y.Z)"
+        description: "Version to build, e.g. 1.2.25 (X.Y.Z)"
         required: true
         type: string
       ref:
@@ -158,50 +168,52 @@ jobs:
           Get-Module -ListAvailable -Name "${{ steps.sign.outputs.module }}" | Format-Table Name, Version
       # ────────────────────────────────────────────────────────────────────────
 
-      - name: Build the Windows app (web build, package, sign if configured, bundle check)
+      - name: Build the Windows app (web build, package, sign if configured, zip, installer, bundle check)
         run: node desktop/scripts/build.mjs --target win --version ${{ inputs.version }}
 
-      # A second, independent verification of the signature build.mjs already
-      # checked — with signtool itself, the tool Windows ships for exactly this.
+      # A second, independent verification of the signatures build.mjs already
+      # checked — with signtool itself, the tool Windows ships for exactly this,
+      # on BOTH files a studio runs: the app exe and the installer.
       # /pa: the default Authenticode policy (what SmartScreen and Explorer apply).
-      - name: Verify the signature with signtool
+      - name: Verify both signatures with signtool
         if: steps.sign.outputs.configured == 'true'
         shell: pwsh
         run: |
-          $exe = "desktop/build/packaged/CropDog-win32-x64/CropDog.exe"
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
           if (-not $signtool) { Write-Output "::error::signtool.exe not found in the Windows SDK on this runner"; exit 1 }
-          & $signtool.FullName verify /pa /v $exe 2>&1 | Tee-Object -Variable out
-          if ($LASTEXITCODE -ne 0) { Write-Output "::error::signtool verify failed on $exe"; exit $LASTEXITCODE }
-          "signtool verify /pa /v: OK" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          ($out | Where-Object { $_ -match 'Issued to:|Issued by:|Expires:|The signature is timestamped:|Successfully verified' }) | ForEach-Object { "    $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           $meta = Get-Content "desktop/dist/CropDog-${{ inputs.version }}-win.json" | ConvertFrom-Json
-          if (-not $meta.signed) { Write-Output "::error::build.mjs recorded the build as UNSIGNED although signing is configured"; exit 1 }
-          # Nothing unsigned leaves this job: the exe is the only PE the build signs
-          # (Electron's DLLs beside it are Microsoft-/Electron-signed or unsigned
-          # upstream and SmartScreen judges the exe), so assert the exe specifically.
-          $s = Get-AuthenticodeSignature -LiteralPath $exe
-          if ($s.Status -ne 'Valid') { Write-Output "::error::Get-AuthenticodeSignature: $($s.Status) $($s.StatusMessage)"; exit 1 }
+          if (-not $meta.signed) { Write-Output "::error::build.mjs recorded the app as UNSIGNED although signing is configured"; exit 1 }
+          if (-not $meta.installer.signed) { Write-Output "::error::build.mjs recorded the installer as UNSIGNED although signing is configured"; exit 1 }
+          foreach ($f in @("desktop/build/packaged/CropDog-win32-x64/CropDog.exe", "desktop/dist/$($meta.installer.file)")) {
+            & $signtool.FullName verify /pa /v $f 2>&1 | Tee-Object -Variable out
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::signtool verify failed on $f"; exit $LASTEXITCODE }
+            $s = Get-AuthenticodeSignature -LiteralPath $f
+            if ($s.Status -ne 'Valid') { Write-Output "::error::Get-AuthenticodeSignature on ${f}: $($s.Status) $($s.StatusMessage)"; exit 1 }
+            "signtool verify /pa /v $(Split-Path -Leaf $f): OK" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            ($out | Where-Object { $_ -match 'Issued to:|The signature is timestamped:|Successfully verified' } | Select-Object -Last 3) | ForEach-Object { "    $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
 
       - name: Size, sha256 and signature
         shell: pwsh
         run: |
           $meta = Get-Content "desktop/dist/CropDog-${{ inputs.version }}-win.json" | ConvertFrom-Json
-          "zip:    $($meta.file)"   | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "size:   $($meta.size)"   | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "sha256: $($meta.sha256)" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "zip:       $($meta.file)"   | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "size:      $($meta.size)"   | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "sha256:    $($meta.sha256)" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
           $sig = if ($meta.signed) { "signed by $($meta.signer)" } else { "UNSIGNED (no certificate profile in desktop/winsign.json)" }
-          "signed: $sig"            | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "signed:    $sig"            | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "installer: $($meta.installer.file)  size $($meta.installer.size)  sha256 $($meta.installer.sha256)  $(if ($meta.installer.signed) { 'signed by ' + $meta.installer.signer } else { 'UNSIGNED' })" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-      # The zip and its .json, for the two check jobs below and for publishing from
-      # the Mac. 7 days is plenty: a build that is not released within a week is
-      # rebuilt from the then-current commit anyway.
+      # The zip, the installer and the .json, for the check jobs below and for
+      # publishing from the Mac. 7 days is plenty: a build that is not released
+      # within a week is rebuilt from the then-current commit anyway.
       - name: Keep the build as an artifact
         uses: actions/upload-artifact@v4
         with:
           name: CropDog-${{ inputs.version }}-win
           path: |
             desktop/dist/CropDog-${{ inputs.version }}-win-x64.zip
+            desktop/dist/CropDog-Setup-${{ inputs.version }}.exe
             desktop/dist/CropDog-${{ inputs.version }}-win.json
           if-no-files-found: error
           retention-days: 7
@@ -222,12 +234,13 @@ jobs:
           # failure — so do not let a non-zero native exit throw the step.
           $PSNativeCommandUseErrorActionPreference = $false
 
-          $repo = "seenu-artona/cropdog-releases"
-          $tag  = "desktop-v${{ inputs.version }}-win"
-          $zip  = "desktop/dist/CropDog-${{ inputs.version }}-win-x64.zip"
-          $json = "desktop/dist/CropDog-${{ inputs.version }}-win.json"
-          $meta = Get-Content $json | ConvertFrom-Json
-          $sig  = if ($meta.signed) { "Signed by $($meta.signer)." } else { "Unsigned build." }
+          $repo  = "seenu-artona/cropdog-releases"
+          $tag   = "desktop-v${{ inputs.version }}-win"
+          $zip   = "desktop/dist/CropDog-${{ inputs.version }}-win-x64.zip"
+          $setup = "desktop/dist/CropDog-Setup-${{ inputs.version }}.exe"
+          $json  = "desktop/dist/CropDog-${{ inputs.version }}-win.json"
+          $meta  = Get-Content $json | ConvertFrom-Json
+          $sig   = if ($meta.signed) { "Signed by $($meta.signer)." } else { "Unsigned build." }
 
           # NEVER overwrite a build users may already be updating from. If the tag
           # is already in the releases repo, stop the job here — do not clobber it.
@@ -237,9 +250,9 @@ jobs:
             exit 1
           }
 
-          # A pre-release, like the existing Windows entries. It attaches the zip
-          # and its .json metadata, and does NOT touch manifest.json.
-          $url = gh release create $tag $zip $json `
+          # A pre-release, like the existing Windows entries. It attaches the zip,
+          # the installer and the .json metadata, and does NOT touch manifest.json.
+          $url = gh release create $tag $zip $setup $json `
             --repo $repo `
             --prerelease `
             --title $tag `
@@ -247,7 +260,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "url:    $url" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-  # ── The real update swap: the shipped version -> this build ───────────────
+  # ── The real update swap: the shipped version -> this build (zip install) ──
   swap-test:
     needs: build-app
     runs-on: windows-latest
@@ -307,6 +320,164 @@ jobs:
           "after the swap: $($exe.FullName) signature $($s.Status), signer $($s.SignerCertificate.Subject)"
           if ($s.Status -ne 'Valid') { Write-Output "::error::the swapped-in CropDog.exe is not validly signed: $($s.Status)"; exit 1 }
           "swapped-in CropDog.exe: signature Valid, $($s.SignerCertificate.Subject)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+  # ── The installer, as a studio meets it ───────────────────────────────────
+  install-test:
+    needs: build-app
+    runs-on: windows-latest
+    env:
+      ARP: 'Software\Microsoft\Windows\CurrentVersion\Uninstall\bbaad8a5-704e-4315-b7e7-d2d472f2a539'   # pinned in desktop/electron-builder.yml
+    steps:
+      - name: Check out crop-dog (for swap.ps1 and the test script)
+        uses: actions/checkout@v4
+        with:
+          repository: seenu-artona/crop-dog
+          ref: ${{ inputs.ref || 'unified' }}
+          ssh-key: ${{ secrets.CROPDOG_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Fetch this build
+        uses: actions/download-artifact@v4
+        with:
+          name: CropDog-${{ inputs.version }}-win
+          path: new
+
+      # A STANDARD user (Users group only, never Administrators) with a random
+      # password that is never printed, installs silently. The installer must need
+      # no elevation: the files land in that user's own %LocalAppData%\Programs.
+      - name: Fresh install as a non-admin user (silent), then check what it left
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $user = "cropdogtest"
+          $pw = ConvertTo-SecureString ([guid]::NewGuid().ToString() + "Aa1!") -AsPlainText -Force
+          New-LocalUser -Name $user -Password $pw -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group "Users" -Member $user
+          if ((Get-LocalGroupMember -Group "Administrators").Name -match "\\$user$") { throw "$user must not be an administrator" }
+          $cred = New-Object System.Management.Automation.PSCredential($user, $pw)
+          $setup = (Resolve-Path "new/CropDog-Setup-${{ inputs.version }}.exe").Path
+          # Run the installer AS that user with their profile loaded, silently, and wait.
+          $p = Start-Process -FilePath $setup -ArgumentList "/S" -Credential $cred -LoadUserProfile -Wait -PassThru -WorkingDirectory $env:RUNNER_TEMP
+          "installer exit code (as ${user}): $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "the installer exited $($p.ExitCode)" }
+          $home2 = "C:\Users\$user"
+          $dir = "$home2\AppData\Local\Programs\CropDog"
+          foreach ($f in @("$dir\CropDog.exe", "$dir\Uninstall CropDog.exe", "$dir\uninstallerIcon.ico", "$dir\resources\app\package.json",
+                           "$home2\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\CropDog.lnk", "$home2\Desktop\CropDog.lnk")) {
+            if (-not (Test-Path -LiteralPath $f)) { throw "missing after install: $f" }
+            "present: $f"
+          }
+          $v = (Get-Content "$dir\resources\app\package.json" | ConvertFrom-Json).version
+          if ($v -ne "${{ inputs.version }}") { throw "installed version is $v" }
+          # The Add/Remove Programs entry lives in THAT user's HKCU: read it as them.
+          $out = Join-Path $env:RUNNER_TEMP "arp.txt"
+          $q = Start-Process -FilePath "$env:SystemRoot\System32\reg.exe" -ArgumentList @("query", "HKCU\$env:ARP", "/v", "DisplayVersion") -Credential $cred -LoadUserProfile -Wait -PassThru -RedirectStandardOutput $out -WorkingDirectory $env:RUNNER_TEMP
+          $arp = Get-Content $out -Raw
+          if ($q.ExitCode -ne 0 -or $arp -notmatch "DisplayVersion\s+REG_SZ\s+${{ inputs.version }}") { throw "Add/Remove Programs entry missing or wrong for ${user}: $arp" }
+          "Add/Remove Programs (as ${user}): DisplayVersion ${{ inputs.version }}"
+          # Nothing may have landed in the machine-wide places an elevated install would use.
+          foreach ($bad in @("$env:ProgramFiles\CropDog", "${env:ProgramFiles(x86)}\CropDog", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\CropDog.lnk")) {
+            if (Test-Path -LiteralPath $bad) { throw "the per-user installer wrote a machine-wide location: $bad" }
+          }
+          if (Test-Path "HKLM:\$env:ARP") { throw "the per-user installer wrote an HKLM uninstall entry" }
+          $s = Get-AuthenticodeSignature -LiteralPath "$dir\Uninstall CropDog.exe"
+          "uninstaller signature: $($s.Status) $($s.SignerCertificate.Subject)"
+          if ("${{ needs.build-app.outputs.configured }}" -eq "true" -and $s.Status -ne "Valid") { throw "the installed uninstaller is not validly signed" }
+          "fresh install as non-admin ${user}: files, Start-menu + desktop shortcuts, Add/Remove entry ${{ inputs.version }}, no machine-wide writes" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      # The same installer for THIS job's own user (the runner's account), so the
+      # launch and the in-folder swap run in a session that can show a window.
+      - name: Install for this account and launch the app from the installed copy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = (Resolve-Path "new/CropDog-Setup-${{ inputs.version }}.exe").Path
+          $p = Start-Process -FilePath $setup -ArgumentList "/S" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the installer exited $($p.ExitCode)" }
+          $dir = "$env:LOCALAPPDATA\Programs\CropDog"
+          if (-not (Test-Path "$dir\CropDog.exe")) { throw "no CropDog.exe at $dir" }
+          $app = Start-Process -FilePath "$dir\CropDog.exe" -PassThru -WorkingDirectory $dir
+          Start-Sleep -Seconds 20
+          $alive = Get-Process -Id $app.Id -ErrorAction SilentlyContinue
+          $log = "$env:APPDATA\CropDog\startup.log"
+          "process alive after 20 s: $([bool]$alive); startup.log present: $(Test-Path $log)"
+          if (Test-Path $log) { Get-Content $log | Select-Object -First 12 }
+          if (-not $alive) { throw "CropDog.exe did not stay running" }
+          if (-not (Test-Path $log)) { throw "the app wrote no startup.log — it did not start" }
+          Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+          Get-Process -Name CropDog -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          "launched from the installed copy: process ran, startup.log written" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      # The in-app update, INSIDE an installed folder: down to the shipped version
+      # (the zip studios are on), then back up to this build — both with the real
+      # swap.ps1 as updater.js launches it. The uninstaller must survive both and
+      # Add/Remove Programs must show the swapped-in version each time.
+      - name: Swap inside the installed folder — to the shipped version and back to this build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "$env:LOCALAPPDATA\Programs\CropDog"
+          $m = (gh api repos/seenu-artona/cropdog-releases/contents/manifest.json -H "Accept: application/vnd.github.raw" | ConvertFrom-Json).latestWin
+          New-Item -ItemType Directory -Force -Path old | Out-Null
+          Invoke-WebRequest -Uri $m.url -OutFile old/shipped.zip
+          if ((Get-FileHash -Algorithm SHA256 old/shipped.zip).Hash.ToLower() -ne $m.sha256) { throw "shipped zip sha256 mismatch" }
+          Expand-Archive -Path old/shipped.zip -DestinationPath old/app -Force
+          Expand-Archive -Path "new/CropDog-${{ inputs.version }}-win-x64.zip" -DestinationPath new/app -Force
+          $ErrorActionPreference = "Continue"
+          "=== swap installed ${{ inputs.version }} -> shipped $($m.version)"
+          node .github/scripts/swap-real-test.mjs $dir old/app $m.version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dv = (Get-ItemProperty -Path "HKCU:\$env:ARP").DisplayVersion
+          if ($dv -ne $m.version) { Write-Output "::error::Add/Remove Programs shows $dv after swapping to $($m.version)"; exit 1 }
+          "=== swap installed $($m.version) -> this build ${{ inputs.version }}"
+          node .github/scripts/swap-real-test.mjs $dir new/app ${{ inputs.version }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dv = (Get-ItemProperty -Path "HKCU:\$env:ARP").DisplayVersion
+          if ($dv -ne "${{ inputs.version }}") { Write-Output "::error::Add/Remove Programs shows $dv after swapping to ${{ inputs.version }}"; exit 1 }
+          foreach ($f in @("$dir\Uninstall CropDog.exe", "$dir\uninstallerIcon.ico")) { if (-not (Test-Path -LiteralPath $f)) { Write-Output "::error::$f did not survive the swaps"; exit 1 } }
+          "swap inside the installed folder: ${{ inputs.version }} -> $($m.version) -> ${{ inputs.version }}; uninstaller kept; Add/Remove shows ${{ inputs.version }}" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Uninstall (both accounts) and check nothing is left
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # This account.
+          $dir = "$env:LOCALAPPDATA\Programs\CropDog"
+          $p = Start-Process -FilePath "$dir\Uninstall CropDog.exe" -ArgumentList "/S" -Wait -PassThru -WorkingDirectory $env:RUNNER_TEMP
+          "uninstaller exit code: $($p.ExitCode)"
+          Start-Sleep -Seconds 5
+          foreach ($f in @($dir, "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\CropDog.lnk", "$env:USERPROFILE\Desktop\CropDog.lnk")) {
+            if (Test-Path -LiteralPath $f) { throw "left behind after uninstall: $f" }
+          }
+          if (Test-Path "HKCU:\$env:ARP") { throw "the Add/Remove Programs entry was left behind" }
+          "this account: install folder, both shortcuts and the Add/Remove entry are gone"
+          # The non-admin user, as them.
+          $user = "cropdogtest"
+          $home2 = "C:\Users\$user"
+          $udir = "$home2\AppData\Local\Programs\CropDog"
+          # The password is not known here (random, never stored): reset it to a new random one for this step only.
+          $pw = ConvertTo-SecureString ([guid]::NewGuid().ToString() + "Aa1!") -AsPlainText -Force
+          Set-LocalUser -Name $user -Password $pw
+          $cred = New-Object System.Management.Automation.PSCredential($user, $pw)
+          $p = Start-Process -FilePath "$udir\Uninstall CropDog.exe" -ArgumentList "/S" -Credential $cred -LoadUserProfile -Wait -PassThru -WorkingDirectory $env:RUNNER_TEMP
+          "uninstaller exit code (as ${user}): $($p.ExitCode)"
+          Start-Sleep -Seconds 5
+          foreach ($f in @($udir, "$home2\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\CropDog.lnk", "$home2\Desktop\CropDog.lnk")) {
+            if (Test-Path -LiteralPath $f) { throw "left behind after uninstall (${user}): $f" }
+          }
+          $out = Join-Path $env:RUNNER_TEMP "arp2.txt"
+          $q = Start-Process -FilePath "$env:SystemRoot\System32\reg.exe" -ArgumentList @("query", "HKCU\$env:ARP") -Credential $cred -LoadUserProfile -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError (Join-Path $env:RUNNER_TEMP "arp2.err") -WorkingDirectory $env:RUNNER_TEMP
+          if ($q.ExitCode -eq 0) { throw "the Add/Remove Programs entry was left behind for ${user}" }
+          "${user}: install folder, both shortcuts and the Add/Remove entry are gone"
+          "uninstall: nothing left for either account (user data in %APPDATA%\CropDog is kept by design)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
   # ── The five-photo box check: Windows CPU runtime vs the Mac ──────────────
   box-check:
