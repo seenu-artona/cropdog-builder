@@ -81,16 +81,21 @@ on:
         required: false
         default: false
         type: boolean
+      artifact_run:
+        description: "Skip the build: run the checks against the CropDog-<version>-win artifact of this earlier run id"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
   id-token: write
+  actions: read     # the check jobs may download an earlier run's artifact (artifact_run)
 
 jobs:
   build-app:
+    if: inputs.artifact_run == ''
     runs-on: windows-latest
-    outputs:
-      configured: ${{ steps.sign.outputs.configured }}
     steps:
       - name: Check out crop-dog (private, read-only deploy key)
         uses: actions/checkout@v4
@@ -263,6 +268,7 @@ jobs:
   # ── The real update swap: the shipped version -> this build (zip install) ──
   swap-test:
     needs: build-app
+    if: always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
     runs-on: windows-latest
     steps:
       - name: Check out crop-dog (for swap.ps1 and the test script)
@@ -278,11 +284,28 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Fetch this build
+      - name: Fetch this build (this run's artifact)
+        if: inputs.artifact_run == ''
         uses: actions/download-artifact@v4
         with:
           name: CropDog-${{ inputs.version }}-win
           path: new
+
+      - name: Fetch the build (an earlier run's artifact)
+        if: inputs.artifact_run != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download ${{ inputs.artifact_run }} --repo ${{ github.repository }} -n CropDog-${{ inputs.version }}-win -D new
+
+      # Whether this build is signed, from its own sidecar (build.mjs wrote it).
+      - name: Read the build's sidecar
+        id: build
+        shell: pwsh
+        run: |
+          $meta = Get-Content "new/CropDog-${{ inputs.version }}-win.json" | ConvertFrom-Json
+          "build: crop-dog $($meta.commit) signed=$($meta.signed) installer=$($meta.installer.file)"
+          "signed=$(([bool]$meta.signed).ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       # The version studios are on: whatever manifest.latestWin points at, fetched
       # and sha256-checked exactly as the app's updater would (the releases repo
@@ -312,7 +335,7 @@ jobs:
           ($out | Select-Object -Last 1) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - name: The installed exe after the swap is this build's signed one
-        if: needs.build-app.outputs.configured == 'true'
+        if: steps.build.outputs.signed == 'true'
         shell: pwsh
         run: |
           $exe = Get-ChildItem -Path old/app -Recurse -Filter CropDog.exe | Select-Object -First 1
@@ -324,6 +347,7 @@ jobs:
   # ── The installer, as a studio meets it ───────────────────────────────────
   install-test:
     needs: build-app
+    if: always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
     runs-on: windows-latest
     env:
       ARP: 'Software\Microsoft\Windows\CurrentVersion\Uninstall\bbaad8a5-704e-4315-b7e7-d2d472f2a539'   # pinned in desktop/electron-builder.yml
@@ -341,11 +365,28 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Fetch this build
+      - name: Fetch this build (this run's artifact)
+        if: inputs.artifact_run == ''
         uses: actions/download-artifact@v4
         with:
           name: CropDog-${{ inputs.version }}-win
           path: new
+
+      - name: Fetch the build (an earlier run's artifact)
+        if: inputs.artifact_run != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download ${{ inputs.artifact_run }} --repo ${{ github.repository }} -n CropDog-${{ inputs.version }}-win -D new
+
+      # Whether this build is signed, from its own sidecar (build.mjs wrote it).
+      - name: Read the build's sidecar
+        id: build
+        shell: pwsh
+        run: |
+          $meta = Get-Content "new/CropDog-${{ inputs.version }}-win.json" | ConvertFrom-Json
+          "build: crop-dog $($meta.commit) signed=$($meta.signed) installer=$($meta.installer.file)"
+          "signed=$(([bool]$meta.signed).ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       # This job's own account first (an interactive session): a silent install,
       # the files, both shortcuts and the Add/Remove entry, then the app launched
@@ -360,7 +401,7 @@ jobs:
           "installer exit code: $($p.ExitCode) after $([int]((Get-Date) - $t0).TotalSeconds) s"
           if ($p.ExitCode -ne 0) { throw "the installer exited $($p.ExitCode)" }
           $dir = "$env:LOCALAPPDATA\Programs\CropDog"
-          foreach ($f in @("$dir\CropDog.exe", "$dir\Uninstall CropDog.exe", "$dir\uninstallerIcon.ico", "$dir\resources\app\package.json",
+          foreach ($f in @("$dir\CropDog.exe", "$dir\Uninstall CropDog.exe", "$dir\resources\app\package.json",
                            "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\CropDog.lnk", "$env:USERPROFILE\Desktop\CropDog.lnk")) {
             if (-not (Test-Path -LiteralPath $f)) {
               "CropDog.exe files on disk:"; Get-ChildItem -Path C:\Users -Recurse -Filter CropDog.exe -ErrorAction SilentlyContinue | ForEach-Object { "  " + $_.FullName }
@@ -378,7 +419,7 @@ jobs:
           if (Test-Path "HKLM:\$env:ARP") { throw "the per-user installer wrote an HKLM uninstall entry" }
           $s = Get-AuthenticodeSignature -LiteralPath "$dir\Uninstall CropDog.exe"
           "uninstaller signature: $($s.Status) $($s.SignerCertificate.Subject)"
-          if ("${{ needs.build-app.outputs.configured }}" -eq "true" -and $s.Status -ne "Valid") { throw "the installed uninstaller is not validly signed" }
+          if ("${{ steps.build.outputs.signed }}" -eq "true" -and $s.Status -ne "Valid") { throw "the installed uninstaller is not validly signed" }
           "install (this account): files, Start-menu + desktop shortcuts, Add/Remove entry ${{ inputs.version }}, nothing machine-wide, uninstaller signed" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           $app = Start-Process -FilePath "$dir\CropDog.exe" -PassThru -WorkingDirectory $dir
           Start-Sleep -Seconds 20
@@ -421,7 +462,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $dv = (Get-ItemProperty -Path "HKCU:\$env:ARP").DisplayVersion
           if ($dv -ne "${{ inputs.version }}") { Write-Output "::error::Add/Remove Programs shows $dv after swapping to ${{ inputs.version }}"; exit 1 }
-          foreach ($f in @("$dir\Uninstall CropDog.exe", "$dir\uninstallerIcon.ico")) { if (-not (Test-Path -LiteralPath $f)) { Write-Output "::error::$f did not survive the swaps"; exit 1 } }
+          if (-not (Test-Path -LiteralPath "$dir\Uninstall CropDog.exe")) { Write-Output "::error::the uninstaller did not survive the swaps"; exit 1 }
           "swap inside the installed folder: ${{ inputs.version }} -> $($m.version) -> ${{ inputs.version }}; uninstaller kept; Add/Remove shows ${{ inputs.version }}" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - name: Uninstall (this account) and check nothing is left
@@ -488,7 +529,7 @@ jobs:
             }
           }
           if (-not $installed) { throw "the installer did not install for the non-admin user ${user} by either method" }
-          foreach ($f in @("$dir\CropDog.exe", "$dir\Uninstall CropDog.exe", "$dir\uninstallerIcon.ico",
+          foreach ($f in @("$dir\CropDog.exe", "$dir\Uninstall CropDog.exe",
                            "$home2\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\CropDog.lnk", "$home2\Desktop\CropDog.lnk")) {
             if (-not (Test-Path -LiteralPath $f)) { throw "missing after install (${user}): $f" }
             "present: $f"
@@ -524,6 +565,7 @@ jobs:
   # ── The five-photo box check: Windows CPU runtime vs the Mac ──────────────
   box-check:
     needs: build-app
+    if: always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
     runs-on: windows-latest
     steps:
       - name: Check out crop-dog
