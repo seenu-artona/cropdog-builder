@@ -1,0 +1,400 @@
+# Builds, CODE-SIGNS and checks the Windows app (Electron, x64) for CropDog, on
+# GitHub's free Windows runners for public repos. The source is the PRIVATE
+# seenu-artona/crop-dog repo, checked out here with a read-only deploy key
+# (secret CROPDOG_DEPLOY_KEY); nothing of it lives in this repo. Run BY HAND
+# only, giving the version number. This is crop-dog's .github/workflows/
+# windows-app.yml (commit de5c786) with the checkout changed, plus two jobs after
+# the build: the real update swap and the five-photo box check.
+#
+# THREE JOBS.
+#   build-app  — builds, signs CropDog.exe, verifies the signature twice, zips,
+#                and keeps the zip + its .json as a workflow ARTIFACT (7 days).
+#                With `publish: true` it ALSO publishes them as the pre-release
+#                desktop-v<version>-win in seenu-artona/cropdog-releases (needs
+#                the RELEASES_TOKEN secret in THIS repo — a fine-grained token
+#                scoped to the releases repo, Contents read/write). It never
+#                touches manifest.json: nothing reaches a studio until
+#                manifest.latestWin is written from the Mac (crop-dog's
+#                desktop/RELEASING.md). Without the secret, publish from the Mac
+#                with the downloaded artifact (RELEASING.md).
+#   swap-test  — the SHIPPED Windows app (manifest.latestWin, the version studios
+#                are on) is replaced in place by this build by the REAL swap.ps1,
+#                launched the way updater.js launches it (.github/scripts/
+#                swap-real-test.mjs in crop-dog). Proves the update installs.
+#   box-check  — the five standard photos (a PRIVATE branch of crop-dog, fetched
+#                at run time with the same deploy key; NEVER in this repo, NEVER
+#                uploaded as an artifact) are parsed on the Windows CPU runtime
+#                (fp32, what a PC without a supported GPU runs) and cropped by the
+#                same engine the app ships; the boxes must equal the Mac's
+#                (native/detect/golden/five-boxes-mac.json). Only the box numbers
+#                leave the runner, in the job summary.
+#
+# CODE SIGNING — Azure Artifact Signing (Microsoft's name since 2026 for Trusted
+# Signing), configured in crop-dog's desktop/winsign.json and read by its
+# desktop/scripts/winsign.mjs. With a certificate profile there (since
+# 2026-10-27: cropdog-public), build.mjs signs CropDog.exe with Microsoft's
+# PowerShell cmdlet (Invoke-ArtifactSigning: the same call electron-builder's
+# azureSignOptions makes), then verifies the signature is Valid, timestamped and
+# by the configured publisher; this job then re-verifies with the Windows SDK's
+# signtool. A build that fails any of those never reaches the artifact or the
+# publish step, so there is no silently unsigned build. (With no profile in
+# winsign.json the build is UNSIGNED and says so; the Azure steps are skipped.)
+#
+# HOW IT AUTHENTICATES — no secret. `azure/login` exchanges this job's GitHub
+# OIDC token for an Azure sign-in through a FEDERATED CREDENTIAL on the Entra
+# app registration "cropdog-builder" (issuer token.actions.githubusercontent.com,
+# subject repo:seenu-artona/cropdog-builder:ref:refs/heads/main — so this
+# workflow signs only when run from `main` of THIS repo). The signing cmdlet then
+# finds that sign-in by itself (Azure's DefaultAzureCredential chain, its
+# AzureCliCredential step). The three values azure/login needs — tenant id,
+# client id, subscription id — are identifiers, kept as this repo's Actions
+# VARIABLES (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_SUBSCRIPTION_ID), not
+# secrets. The app registration has NO client secret. `id-token: write` lets the
+# job mint the OIDC token; it grants nothing else.
+name: Windows app
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, e.g. 1.2.24 (X.Y.Z)"
+        required: true
+        type: string
+      ref:
+        description: "crop-dog branch or commit to build"
+        required: false
+        default: unified
+        type: string
+      publish:
+        description: "Also publish the pre-release desktop-v<version>-win to cropdog-releases (needs RELEASES_TOKEN here)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-app:
+    runs-on: windows-latest
+    outputs:
+      configured: ${{ steps.sign.outputs.configured }}
+    steps:
+      - name: Check out crop-dog (private, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: seenu-artona/crop-dog
+          ref: ${{ inputs.ref || 'unified' }}
+          ssh-key: ${{ secrets.CROPDOG_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Which commit
+        shell: pwsh
+        run: |
+          "crop-dog: $(git log -1 --format='%H %s')" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if (git status --porcelain) { Write-Output "::error::checkout is not clean"; exit 1 }
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies (repo)
+        run: npm ci
+
+      - name: Install dependencies (desktop)
+        run: npm ci
+        working-directory: desktop
+
+      # The one reader of desktop/winsign.json decides, so the workflow, build.mjs
+      # and release.mjs cannot disagree about whether this build signs.
+      - name: Read the code-signing configuration
+        id: sign
+        shell: pwsh
+        run: |
+          $cfg = node -e "import('./desktop/scripts/winsign.mjs').then(m => { const c = m.readWinSign('desktop/winsign.json'); console.log(JSON.stringify({ configured: c.configured, why: c.why || '', account: c.account, profile: c.profile || '', module: m.MODULE })) })"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $c = $cfg | ConvertFrom-Json
+          if ($c.configured) {
+            Write-Output "signing: Azure Artifact Signing, account $($c.account), profile $($c.profile)"
+          } else {
+            Write-Output "::warning title=Unsigned Windows build::$($c.why)"
+            Write-Output $c.why
+          }
+          "configured=$($c.configured.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "module=$($c.module.name)"                            | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "module_version=$($c.module.version)"                 | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # ── Signing only (skipped when no profile is configured) ────────────────
+      - name: Check the Azure identifiers are set (variables, not secrets)
+        if: steps.sign.outputs.configured == 'true'
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          $missing = @("AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_SUBSCRIPTION_ID") | Where-Object { [string]::IsNullOrWhiteSpace((Get-Item "env:$_" -ErrorAction SilentlyContinue).Value) }
+          if ($missing) {
+            Write-Output "::error::Signing is configured (desktop/winsign.json) but these repository VARIABLES are not set: $($missing -join ', '). Set them under Settings > Secrets and variables > Actions > Variables (they are identifiers, not secrets). See crop-dog's desktop/RELEASING.md."
+            exit 1
+          }
+
+      - name: Sign in to Azure with this job's OIDC token (no client secret)
+        if: steps.sign.outputs.configured == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Microsoft's signing module (pinned)
+        if: steps.sign.outputs.configured == 'true'
+        shell: pwsh
+        run: |
+          Install-Module -Name "${{ steps.sign.outputs.module }}" -RequiredVersion "${{ steps.sign.outputs.module_version }}" -Repository PSGallery -Scope CurrentUser -Force
+          Get-Module -ListAvailable -Name "${{ steps.sign.outputs.module }}" | Format-Table Name, Version
+      # ────────────────────────────────────────────────────────────────────────
+
+      - name: Build the Windows app (web build, package, sign if configured, bundle check)
+        run: node desktop/scripts/build.mjs --target win --version ${{ inputs.version }}
+
+      # A second, independent verification of the signature build.mjs already
+      # checked — with signtool itself, the tool Windows ships for exactly this.
+      # /pa: the default Authenticode policy (what SmartScreen and Explorer apply).
+      - name: Verify the signature with signtool
+        if: steps.sign.outputs.configured == 'true'
+        shell: pwsh
+        run: |
+          $exe = "desktop/build/packaged/CropDog-win32-x64/CropDog.exe"
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
+          if (-not $signtool) { Write-Output "::error::signtool.exe not found in the Windows SDK on this runner"; exit 1 }
+          & $signtool.FullName verify /pa /v $exe 2>&1 | Tee-Object -Variable out
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::signtool verify failed on $exe"; exit $LASTEXITCODE }
+          "signtool verify /pa /v: OK" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          ($out | Where-Object { $_ -match 'Issued to:|Issued by:|Expires:|The signature is timestamped:|Successfully verified' }) | ForEach-Object { "    $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          $meta = Get-Content "desktop/dist/CropDog-${{ inputs.version }}-win.json" | ConvertFrom-Json
+          if (-not $meta.signed) { Write-Output "::error::build.mjs recorded the build as UNSIGNED although signing is configured"; exit 1 }
+          # Nothing unsigned leaves this job: the exe is the only PE the build signs
+          # (Electron's DLLs beside it are Microsoft-/Electron-signed or unsigned
+          # upstream and SmartScreen judges the exe), so assert the exe specifically.
+          $s = Get-AuthenticodeSignature -LiteralPath $exe
+          if ($s.Status -ne 'Valid') { Write-Output "::error::Get-AuthenticodeSignature: $($s.Status) $($s.StatusMessage)"; exit 1 }
+
+      - name: Size, sha256 and signature
+        shell: pwsh
+        run: |
+          $meta = Get-Content "desktop/dist/CropDog-${{ inputs.version }}-win.json" | ConvertFrom-Json
+          "zip:    $($meta.file)"   | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "size:   $($meta.size)"   | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "sha256: $($meta.sha256)" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          $sig = if ($meta.signed) { "signed by $($meta.signer)" } else { "UNSIGNED (no certificate profile in desktop/winsign.json)" }
+          "signed: $sig"            | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      # The zip and its .json, for the two check jobs below and for publishing from
+      # the Mac. 7 days is plenty: a build that is not released within a week is
+      # rebuilt from the then-current commit anyway.
+      - name: Keep the build as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CropDog-${{ inputs.version }}-win
+          path: |
+            desktop/dist/CropDog-${{ inputs.version }}-win-x64.zip
+            desktop/dist/CropDog-${{ inputs.version }}-win.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Publish the pre-release to the releases repo
+        if: inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            Write-Output "::error::publish was requested but the RELEASES_TOKEN secret is not set in this repo. Either set it (a fine-grained token scoped to seenu-artona/cropdog-releases, Contents read/write) or publish from the Mac with the artifact (crop-dog's desktop/RELEASING.md)."
+            exit 1
+          }
+          # We check $LASTEXITCODE ourselves: `gh release view` on a tag that does
+          # not exist exits non-zero, and here that is the NORMAL path, not a
+          # failure — so do not let a non-zero native exit throw the step.
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $repo = "seenu-artona/cropdog-releases"
+          $tag  = "desktop-v${{ inputs.version }}-win"
+          $zip  = "desktop/dist/CropDog-${{ inputs.version }}-win-x64.zip"
+          $json = "desktop/dist/CropDog-${{ inputs.version }}-win.json"
+          $meta = Get-Content $json | ConvertFrom-Json
+          $sig  = if ($meta.signed) { "Signed by $($meta.signer)." } else { "Unsigned build." }
+
+          # NEVER overwrite a build users may already be updating from. If the tag
+          # is already in the releases repo, stop the job here — do not clobber it.
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "::error::Release $tag already exists in $repo — refusing to overwrite it."
+            exit 1
+          }
+
+          # A pre-release, like the existing Windows entries. It attaches the zip
+          # and its .json metadata, and does NOT touch manifest.json.
+          $url = gh release create $tag $zip $json `
+            --repo $repo `
+            --prerelease `
+            --title $tag `
+            --notes "Windows build for CropDog ${{ inputs.version }}. $sig Not live for users until manifest.latestWin is updated separately (desktop/RELEASING.md)."
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "url:    $url" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+  # ── The real update swap: the shipped version -> this build ───────────────
+  swap-test:
+    needs: build-app
+    runs-on: windows-latest
+    steps:
+      - name: Check out crop-dog (for swap.ps1 and the test script)
+        uses: actions/checkout@v4
+        with:
+          repository: seenu-artona/crop-dog
+          ref: ${{ inputs.ref || 'unified' }}
+          ssh-key: ${{ secrets.CROPDOG_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Fetch this build
+        uses: actions/download-artifact@v4
+        with:
+          name: CropDog-${{ inputs.version }}-win
+          path: new
+
+      # The version studios are on: whatever manifest.latestWin points at, fetched
+      # and sha256-checked exactly as the app's updater would (the releases repo
+      # is public; the job's own token reads it).
+      - name: Fetch the shipped Windows app (manifest.latestWin)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $m = (gh api repos/seenu-artona/cropdog-releases/contents/manifest.json -H "Accept: application/vnd.github.raw" | ConvertFrom-Json).latestWin
+          "shipped Windows version: $($m.version) ($($m.url))" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          New-Item -ItemType Directory -Force -Path old | Out-Null
+          Invoke-WebRequest -Uri $m.url -OutFile old/shipped.zip
+          $got = (Get-FileHash -Algorithm SHA256 old/shipped.zip).Hash.ToLower()
+          if ($got -ne $m.sha256) { throw "shipped zip sha256 $got != manifest $($m.sha256)" }
+          if ((Get-Item old/shipped.zip).Length -ne $m.size) { throw "shipped zip size mismatch" }
+          Expand-Archive -Path old/shipped.zip -DestinationPath old/app -Force
+          Expand-Archive -Path "new/CropDog-${{ inputs.version }}-win-x64.zip" -DestinationPath new/app -Force
+          Remove-Item old/shipped.zip -Force
+
+      - name: Run the REAL swap.ps1, as updater.js launches it, from the shipped version to this build
+        shell: pwsh
+        run: |
+          node .github/scripts/swap-real-test.mjs old/app new/app ${{ inputs.version }} 2>&1 | Tee-Object -Variable out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ($out | Select-Object -Last 1) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: The installed exe after the swap is this build's signed one
+        if: needs.build-app.outputs.configured == 'true'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path old/app -Recurse -Filter CropDog.exe | Select-Object -First 1
+          $s = Get-AuthenticodeSignature -LiteralPath $exe.FullName
+          "after the swap: $($exe.FullName) signature $($s.Status), signer $($s.SignerCertificate.Subject)"
+          if ($s.Status -ne 'Valid') { Write-Output "::error::the swapped-in CropDog.exe is not validly signed: $($s.Status)"; exit 1 }
+          "swapped-in CropDog.exe: signature Valid, $($s.SignerCertificate.Subject)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+  # ── The five-photo box check: Windows CPU runtime vs the Mac ──────────────
+  box-check:
+    needs: build-app
+    runs-on: windows-latest
+    steps:
+      - name: Check out crop-dog
+        uses: actions/checkout@v4
+        with:
+          repository: seenu-artona/crop-dog
+          ref: ${{ inputs.ref || 'unified' }}
+          ssh-key: ${{ secrets.CROPDOG_DEPLOY_KEY }}
+          persist-credentials: false
+
+      # The five photos live on a PRIVATE branch of crop-dog, fetched with the same
+      # read-only key. They stay on this runner's disk and nowhere else: no
+      # artifact, no cache, no log line with pixels in it.
+      - name: Fetch the five standard photos (private branch, never uploaded)
+        uses: actions/checkout@v4
+        with:
+          repository: seenu-artona/crop-dog
+          ref: five-photos
+          ssh-key: ${{ secrets.CROPDOG_DEPLOY_KEY }}
+          persist-credentials: false
+          path: photos
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies (repo — run_crop3 needs sharp and the engine)
+        run: npm ci
+
+      # The SAME runtime and model a Windows PC downloads (desktop/components.json
+      # names them; sha256-checked as the app checks them). The cpu runtime is the
+      # path a PC without a supported GPU runs — fp32 on the processor.
+      - name: Fetch the Windows CPU runtime and the fp16 model from the releases repo
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $c = (Get-Content desktop/components.json | ConvertFrom-Json).win32
+          $rt = $c.runtimes.cpu
+          $rtf = $rt.files[0]
+          New-Item -ItemType Directory -Force -Path dl, model | Out-Null
+          gh release download $rt.release --repo seenu-artona/cropdog-releases --pattern $rtf.name --dir dl
+          if ($LASTEXITCODE -ne 0) { throw "could not download the cpu runtime" }
+          $got = (Get-FileHash -Algorithm SHA256 "dl/$($rtf.name)").Hash.ToLower()
+          if ($got -ne $rtf.sha256) { throw "runtime sha256 $got != components.json $($rtf.sha256)" }
+          foreach ($f in $c.model.files) {
+            gh release download $c.model.release --repo seenu-artona/cropdog-releases --pattern $f.name --dir model
+            if ($LASTEXITCODE -ne 0) { throw "could not download model file $($f.name)" }
+            $h = (Get-FileHash -Algorithm SHA256 "model/$($f.name)").Hash.ToLower()
+            if ($h -ne $f.sha256) { throw "model file $($f.name) sha256 $h != components.json $($f.sha256)" }
+          }
+          "runtime: $($rt.version)  model: $($c.model.version)" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          $root = Join-Path $env:RUNNER_TEMP "rt"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          tar -xzf "dl/$($rtf.name)" -C $root
+          Remove-Item "dl/$($rtf.name)" -Force
+          $py = Join-Path $root "runtime\python.exe"
+          if (-not (Test-Path $py)) { throw "python.exe not found at $py after unpack" }
+          "PY=$py" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Parse the five photos on the CPU runtime (fp32) and crop them with the app's engine
+        shell: pwsh
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $names = Get-ChildItem photos -Filter *.JPG | ForEach-Object { $_.BaseName }
+          "photos on disk: $($names.Count)"
+          if ($names.Count -ne 5) { throw "expected the five standard photos, found $($names.Count)" }
+          & $env:PY -I native/detect/cli.py --in photos --out maps --device cpu --precision fp32 --model model
+          if ($LASTEXITCODE -ne 0) { throw "cli.py failed" }
+          node native/detect/run_crop3.mjs --parts maps --out boxes-win.json
+          if ($LASTEXITCODE -ne 0) { throw "run_crop3 failed" }
+
+      - name: Compare with the Mac's boxes (only box numbers leave the runner)
+        shell: pwsh
+        run: |
+          node native/detect/compare_boxes_json.mjs native/detect/golden/five-boxes-mac.json boxes-win.json 2>&1 | Tee-Object -Variable out
+          $rc = $LASTEXITCODE
+          "box check (Windows cpu fp32 vs Mac mps fp16):" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          $out | ForEach-Object { "    $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          # Belt and braces: the photos and maps must not be in anything that is
+          # uploaded. This job uploads nothing; make that a checked fact.
+          Remove-Item -Recurse -Force photos, maps
+          exit $rc

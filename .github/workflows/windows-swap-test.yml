@@ -1,0 +1,65 @@
+# The Windows update-swap test, run here (a public repo: free Actions) against
+# the private crop-dog repo's current `unified`. It is crop-dog's
+# .github/workflows/windows-swap-test.yml with one change: the checkout goes
+# through a read-only deploy key (secret CROPDOG_DEPLOY_KEY). Everything it runs —
+# desktop/lib/swap.ps1 and .github/scripts/swap-prod-test.mjs — comes from that
+# checkout; nothing of crop-dog's source lives in this repo.
+#
+# What it proves: the REAL swap.ps1, launched THE WAY updater.js launches it
+# (cmd /c start "" /b powershell -File, detached, stdio ignore, windowsHide),
+# replaces the app folder in place under the two conditions that broke every
+# Windows release from 1.2.2 to 1.2.9 — the helper's cwd inside the app folder,
+# and an external handle on a file in it. No build, no model, no photo, and the
+# deploy key is the only secret.
+name: Windows swap test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "crop-dog branch or commit to test"
+        required: false
+        default: unified
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  swap-test:
+    runs-on: windows-latest
+    steps:
+      - name: Check out crop-dog (private, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: seenu-artona/crop-dog
+          ref: ${{ inputs.ref || 'unified' }}
+          ssh-key: ${{ secrets.CROPDOG_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Which commit
+        shell: pwsh
+        run: git log -1 --format='%H %s' | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      # Parse swap.ps1 under Windows PowerShell 5.1 (the engine that runs it in
+      # production), NOT pwsh 7. 5.1 reads a BOM-less file as the ANSI code page, so a
+      # stray non-ASCII byte or any syntax slip makes the whole script fail to parse
+      # and run as a SILENT no-op (empty swap.log) — the studio stays on the old
+      # version with no error. Fail here, loudly, with the line number instead.
+      - name: Parse-check swap.ps1 under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path desktop/lib/swap.ps1), [ref]$null, [ref]$errs) | Out-Null
+          if ($errs -and $errs.Count) {
+            $errs | ForEach-Object { Write-Host ("line {0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }
+            exit 1
+          }
+          Write-Host "swap.ps1 parses clean under Windows PowerShell $($PSVersionTable.PSVersion)"
+
+      # The launch goes through Node child_process.spawn so the Node -> cmd ->
+      # PowerShell -File quoting and the inherited working directory match
+      # updater.js exactly. A YAML `run:` step cannot reproduce that.
+      - name: Run the REAL swap.ps1 as updater.js launches it, under production conditions
+        shell: pwsh
+        run: node .github/scripts/swap-prod-test.mjs
