@@ -33,7 +33,8 @@ jobs:
           $guid = "bbaad8a5-704e-4315-b7e7-d2d472f2a539"
           "LOCALAPPDATA=$env:LOCALAPPDATA  APPDATA=$env:APPDATA  TEMP=$env:TEMP  USERPROFILE=$env:USERPROFILE"
           "User Shell Folders:"; Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" | Format-List | Out-String -Width 200
-          "--- before: HKCU\Software\$guid exists: $(Test-Path "HKCU:\Software\$guid")"
+          $k = "HKCU:\Software\$guid"
+          "--- before: $k exists: " + (Test-Path $k)
           $t0 = Get-Date
           $p = Start-Process -FilePath $setup -ArgumentList "/S" -Wait -PassThru
           "/S exit $($p.ExitCode) after $([int]((Get-Date) - $t0).TotalSeconds) s"
@@ -59,4 +60,4 @@ jobs:
           Get-Process -Name CropDog -ErrorAction SilentlyContinue | ForEach-Object { "CropDog process running: $($_.Path)"; Stop-Process -Id $_.Id -Force }
           "--- $env:LOCALAPPDATA\Programs:"; Get-ChildItem "$env:LOCALAPPDATA\Programs" -ErrorAction SilentlyContinue | ForEach-Object { "  " + $_.FullName }
           $dir = "$env:LOCALAPPDATA\Programs\CropDog"
-          if (Test-Path $dir) { "--- $dir has $((Get-ChildItem $dir -Recurse -File).Count) files"; Get-ChildItem $dir | ForEach-Object { "  " + $_.Name } }
+          if (Test-Path $dir) { $n = (Get-ChildItem $dir -Recurse -File).Count; "--- $dir has $n files"; Get-ChildItem $dir | ForEach-Object { "  " + $_.Name } }
