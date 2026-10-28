@@ -7,7 +7,7 @@
 # after the build: the real update swap, the installer (install / launch / swap
 # inside the installed folder / uninstall), and the five-photo box check.
 #
-# FOUR JOBS.
+# FIVE JOBS.
 #   build-app    — builds, signs CropDog.exe, builds the per-user INSTALLER
 #                  (CropDog-Setup-<v>.exe, electron-builder NSIS from the same
 #                  packaged folder; its uninstaller and the installer are signed
@@ -30,6 +30,9 @@
 #                  an installed folder (down to the shipped version, back up to
 #                  this one: the uninstaller survives, Add/Remove shows the new
 #                  version); then uninstall, leaving no files, shortcuts or entry.
+#   fallback-test — the automatic GPU -> processor switch (crop-dog 1.2.26+), forced
+#                  twice (helper dies on start; dies on the first photo): all five
+#                  photos parsed on the processor, boxes identical to the Mac's.
 #   box-check    — the five standard photos (a PRIVATE branch of crop-dog, fetched
 #                  at run time with the same deploy key; NEVER in this repo, NEVER
 #                  uploaded as an artifact) are parsed on the Windows CPU runtime
@@ -551,6 +554,57 @@ jobs:
           $q = Start-Process -FilePath "$env:SystemRoot\System32\reg.exe" -ArgumentList @("query", "HKCU\$env:ARP") -Credential $cred -LoadUserProfile -Wait -PassThru -RedirectStandardOutput "$T\arp2.txt" -RedirectStandardError "$T\arp2.err" -WorkingDirectory $T
           if ($q.ExitCode -eq 0) { throw "the Add/Remove Programs entry was left behind for ${user}" }
           "uninstall (${user}): install folder, both shortcuts and the Add/Remove entry are gone" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+  # ── The automatic GPU -> processor fallback, forced (crop-dog 1.2.26+) ──────
+  # The app's own ParserHost with the real runtimes and model: the machine is made
+  # to choose the Intel GPU runtime, the GPU helper is made to fail ("start": dies
+  # before ready; "first": dies on the first photo), and the host must switch to
+  # the processor runtime — downloading it — parse all five photos, give boxes
+  # identical to the Mac's, and remember the result. Photos as in box-check:
+  # fetched from the private branch, never uploaded. Needs no build artifact.
+  fallback-test:
+    needs: build-app
+    if: always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [start, first]
+    steps:
+      - name: Check out crop-dog
+        uses: actions/checkout@v4
+        with:
+          repository: seenu-artona/crop-dog
+          ref: ${{ inputs.ref || 'unified' }}
+          ssh-key: ${{ secrets.CROPDOG_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Fetch the five standard photos (private branch, never uploaded)
+        uses: actions/checkout@v4
+        with:
+          repository: seenu-artona/crop-dog
+          ref: five-photos
+          ssh-key: ${{ secrets.CROPDOG_DEPLOY_KEY }}
+          persist-credentials: false
+          path: photos
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies (repo — run_crop3 needs sharp and the engine)
+        run: npm ci
+
+      - name: Forced GPU failure (${{ matrix.mode }}) -> processor, five photos, boxes vs the Mac
+        shell: pwsh
+        run: |
+          node desktop/scripts/gpu-fallback-test.mjs photos "$env:RUNNER_TEMP\fb-${{ matrix.mode }}" ${{ matrix.mode }} 2>&1 | Tee-Object -Variable out
+          $rc = $LASTEXITCODE
+          "forced fallback (${{ matrix.mode }}):" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          ($out | Where-Object { $_ -match '^(ok  |FAIL|  log: GPU fallback|[0-9] identical|5E7A|forced fallback|FORCED)' }) | ForEach-Object { "    $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Remove-Item -Recurse -Force photos -ErrorAction SilentlyContinue
+          exit $rc
 
   # ── The five-photo box check: Windows CPU runtime vs the Mac ──────────────
   box-check:
