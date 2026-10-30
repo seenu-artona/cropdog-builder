@@ -89,6 +89,11 @@ on:
         required: false
         default: ""
         type: string
+      only:
+        description: "Run only this check job (swap-test, install-test, fallback-test, box-check, live-timing); empty = all"
+        required: false
+        default: ""
+        type: string
       live_repeat:
         description: "Live timing: copies of each of the five photos per run (40 = 200 photos)"
         required: false
@@ -281,7 +286,7 @@ jobs:
   # ── The real update swap: the shipped version -> this build (zip install) ──
   swap-test:
     needs: build-app
-    if: always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
+    if: (inputs.only == '' || inputs.only == 'swap-test') && always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
     runs-on: windows-latest
     steps:
       - name: Check out crop-dog (for swap.ps1 and the test script)
@@ -360,7 +365,7 @@ jobs:
   # ── The installer, as a studio meets it ───────────────────────────────────
   install-test:
     needs: build-app
-    if: always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
+    if: (inputs.only == '' || inputs.only == 'install-test') && always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
     runs-on: windows-latest
     env:
       ARP: 'Software\Microsoft\Windows\CurrentVersion\Uninstall\bbaad8a5-704e-4315-b7e7-d2d472f2a539'   # pinned in desktop/electron-builder.yml
@@ -574,7 +579,7 @@ jobs:
   # fetched from the private branch, never uploaded. Needs no build artifact.
   fallback-test:
     needs: build-app
-    if: always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
+    if: (inputs.only == '' || inputs.only == 'fallback-test') && always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -619,7 +624,7 @@ jobs:
   # ── The five-photo box check: Windows CPU runtime vs the Mac ──────────────
   box-check:
     needs: build-app
-    if: always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
+    if: (inputs.only == '' || inputs.only == 'box-check') && always() && (needs.build-app.result == 'success' || inputs.artifact_run != '')
     runs-on: windows-latest
     steps:
       - name: Check out crop-dog
@@ -722,7 +727,7 @@ jobs:
   # photos stay on this runner: nothing is uploaded; only numbers reach the summary.
   live-timing:
     needs: build-app
-    if: always() && inputs.live_timing && (needs.build-app.result == 'success' || inputs.artifact_run != '')
+    if: (inputs.only == '' || inputs.only == 'live-timing') && always() && inputs.live_timing && (needs.build-app.result == 'success' || inputs.artifact_run != '')
     runs-on: windows-latest
     timeout-minutes: 345
     strategy:
