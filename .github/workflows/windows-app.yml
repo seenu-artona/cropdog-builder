@@ -95,7 +95,7 @@ on:
         default: "40"
         type: string
       live_timing:
-        description: "Also time the live cropping view on vs off (off / plain / on, the five photos x40 in the real app, on the processor; three runners, ~2 h)"
+        description: "Also time the live cropping view on vs off (release / off / off2 / plain / on, the five photos x40 in the real app, on the processor; three runners, ~3 h)"
         required: false
         default: false
         type: boolean
@@ -710,32 +710,34 @@ jobs:
           exit $rc
 
   # ── The live cropping view's speed check (crop-dog 1.2.30+) ────────────────
-  # The real, unpacked app crops the five photos x40 (200) with the live view ON
-  # and OFF, timed from Start until the screen turns into review
-  # (desktop/scripts/live-timing.mjs). On this runner there is no GPU, so it is
-  # the processor path — the slow Windows case. The view ships only if ON is
-  # within 2% of OFF. Signs in as a dedicated TEST member of CropDog Test Studio
-  # with its password (secret CROPDOG_TEST_PASSWORD); no service key. The photos
-  # stay on this runner: nothing is uploaded, and only numbers are written out.
+  # The real, unpacked app crops the five photos x40 (200) per run, in a block of
+  # five arms (desktop/scripts/live-timing.mjs): release (the shipped 1.2.29 —
+  # the 400 px preview and the old popup), off, off again, plain (the photo, no
+  # effects) and on (the full view); each arm a fresh start + a 5-photo warm-up.
+  # One block per runner, three runners in parallel, each starting its rotation at
+  # a different arm; every comparison is within one runner. No GPU here: the
+  # processor path, the slow Windows case. Runner 1 also times Stop at the
+  # lowered window priority. Signs in as a dedicated TEST member of CropDog Test
+  # Studio with its password (secret CROPDOG_TEST_PASSWORD); no service key. The
+  # photos stay on this runner: nothing is uploaded; only numbers reach the summary.
   live-timing:
     needs: build-app
     if: always() && inputs.live_timing && (needs.build-app.result == 'success' || inputs.artifact_run != '')
     runs-on: windows-latest
-    timeout-minutes: 300
-    # THREE ARMS — off (no photo), plain (the photo, no effects), on (the full
-    # view) — one block per runner, in parallel. Each block runs all three on the
-    # SAME machine (runners differ), in a rotated order (a Latin square across the
-    # three), and each arm is judged against its own block's "off".
+    timeout-minutes: 345
     strategy:
       fail-fast: false
       matrix:
         include:
           - block: 1
-            runs: warm,off,plain,on
+            start: 0
+            stops: 3
           - block: 2
-            runs: warm,on,off,plain
+            start: 2
+            stops: 0
           - block: 3
-            runs: warm,plain,on,off
+            start: 4
+            stops: 0
     steps:
       - name: Check out crop-dog (the harness and the app's public config)
         uses: actions/checkout@v4
@@ -773,20 +775,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh run download ${{ inputs.artifact_run }} --repo ${{ github.repository }} -n CropDog-${{ inputs.version }}-win -D new
 
-      - name: Time the live view, block ${{ matrix.block }} (off / plain / on, 200 photos per run)
+      - name: Fetch the release arm (the shipped 1.2.29 Windows build)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          gh release download desktop-v1.2.29-win --repo seenu-artona/cropdog-releases --pattern CropDog-1.2.29-win-x64.zip --dir rel
+          if ($LASTEXITCODE -ne 0) { throw "could not download 1.2.29" }
+
+      - name: Time the live view, block ${{ matrix.block }} (release / off / off2 / plain / on, 200 photos per run)
         shell: pwsh
         env:
           CROPDOG_TEST_EMAIL: ${{ vars.CROPDOG_TEST_EMAIL }}
           CROPDOG_TEST_PASSWORD: ${{ secrets.CROPDOG_TEST_PASSWORD }}
           CROPDOG_TEST_MACHINE_ID: "1ec0000000000001"   # the Mac harness's too: one test computer, no takeovers
-          CROPDOG_TEST_DEVICE_NAME: "Live timing (Windows builder)"
+          CROPDOG_TEST_DEVICE_NAME: "Live timing"
         run: |
           $ErrorActionPreference = "Stop"
           Expand-Archive -Path "new/CropDog-${{ inputs.version }}-win-x64.zip" -DestinationPath app -Force
+          Expand-Archive -Path "rel/CropDog-1.2.29-win-x64.zip" -DestinationPath relapp -Force
           $exe = (Get-ChildItem -Path app -Recurse -Filter CropDog.exe | Select-Object -First 1).FullName
-          node desktop/scripts/live-timing.mjs --app $exe --photos photos --repeat ${{ inputs.live_repeat || '40' }} --runs ${{ matrix.runs }} --out live-timing.json 2>&1 | Tee-Object -Variable out
+          $rel = (Get-ChildItem -Path relapp -Recurse -Filter CropDog.exe | Select-Object -First 1).FullName
+          node desktop/scripts/live-timing.mjs --app $exe --release-app $rel --photos photos --repeat ${{ inputs.live_repeat || '40' }} --blocks 1 --block-start ${{ matrix.start }} --stop-trials ${{ matrix.stops }} --out live-timing.json 2>&1 | Tee-Object -Variable out
           $rc = $LASTEXITCODE
           Remove-Item -Recurse -Force photos -ErrorAction SilentlyContinue
           "live view timing, block ${{ matrix.block }} (Windows, processor, 200 photos per run):" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          ($out | Where-Object { $_ -match '(photos in|block:|MEANS|previews|NO PHOTO|WINDOW WAS HIDDEN|timed out|Error)' }) | ForEach-Object { "    $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          ($out | Where-Object { $_ -match '(photos in|^.{9}block |MEANS|previews|STOP|stop [0-9]|NO PHOTO|WINDOW WAS HIDDEN|STEP FAILED|page:|timed out|Error)' }) | ForEach-Object { "    $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           exit $rc
