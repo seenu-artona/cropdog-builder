@@ -89,6 +89,11 @@ on:
         required: false
         default: ""
         type: string
+      live_timing:
+        description: "Also time the live cropping view on vs off (the five photos x40 in the real app, on the processor; ~2 h)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -697,4 +702,72 @@ jobs:
           # Belt and braces: the photos and maps must not be in anything that is
           # uploaded. This job uploads nothing; make that a checked fact.
           Remove-Item -Recurse -Force photos, maps
+          exit $rc
+
+  # ── The live cropping view's speed check (crop-dog 1.2.30+) ────────────────
+  # The real, unpacked app crops the five photos x40 (200) with the live view ON
+  # and OFF, timed from Start until the screen turns into review
+  # (desktop/scripts/live-timing.mjs). On this runner there is no GPU, so it is
+  # the processor path — the slow Windows case. The view ships only if ON is
+  # within 2% of OFF. Signs in as a dedicated TEST member of CropDog Test Studio
+  # with its password (secret CROPDOG_TEST_PASSWORD); no service key. The photos
+  # stay on this runner: nothing is uploaded, and only numbers are written out.
+  live-timing:
+    needs: build-app
+    if: always() && inputs.live_timing && (needs.build-app.result == 'success' || inputs.artifact_run != '')
+    runs-on: windows-latest
+    timeout-minutes: 330
+    steps:
+      - name: Check out crop-dog (the harness and the app's public config)
+        uses: actions/checkout@v4
+        with:
+          repository: seenu-artona/crop-dog
+          ref: ${{ inputs.ref || 'unified' }}
+          ssh-key: ${{ secrets.CROPDOG_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Fetch the five standard photos (private branch, never uploaded)
+        uses: actions/checkout@v4
+        with:
+          repository: seenu-artona/crop-dog
+          ref: five-photos
+          ssh-key: ${{ secrets.CROPDOG_DEPLOY_KEY }}
+          persist-credentials: false
+          path: photos
+
+      - name: Set up Node 22 (the harness uses the built-in WebSocket)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch this build (this run's artifact)
+        if: inputs.artifact_run == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: CropDog-${{ inputs.version }}-win
+          path: new
+
+      - name: Fetch the build (an earlier run's artifact)
+        if: inputs.artifact_run != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download ${{ inputs.artifact_run }} --repo ${{ github.repository }} -n CropDog-${{ inputs.version }}-win -D new
+
+      - name: Time the live view, on vs off (200 photos per run)
+        shell: pwsh
+        env:
+          CROPDOG_TEST_EMAIL: ${{ vars.CROPDOG_TEST_EMAIL }}
+          CROPDOG_TEST_PASSWORD: ${{ secrets.CROPDOG_TEST_PASSWORD }}
+          CROPDOG_TEST_MACHINE_ID: "1ec0000000000002"
+          CROPDOG_TEST_DEVICE_NAME: "Live timing (Windows builder)"
+        run: |
+          $ErrorActionPreference = "Stop"
+          Expand-Archive -Path "new/CropDog-${{ inputs.version }}-win-x64.zip" -DestinationPath app -Force
+          $exe = (Get-ChildItem -Path app -Recurse -Filter CropDog.exe | Select-Object -First 1).FullName
+          node desktop/scripts/live-timing.mjs --app $exe --photos photos --repeat 40 --runs warm,on,off,off,on --out live-timing.json 2>&1 | Tee-Object -Variable out
+          $rc = $LASTEXITCODE
+          Remove-Item -Recurse -Force photos -ErrorAction SilentlyContinue
+          "live view timing (Windows, processor, 200 photos per run):" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          ($out | Where-Object { $_ -match '(photos in|ON .* OFF|WINDOW WAS HIDDEN|timed out|Error)' }) | ForEach-Object { "    $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           exit $rc
