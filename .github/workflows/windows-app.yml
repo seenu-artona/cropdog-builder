@@ -89,6 +89,11 @@ on:
         required: false
         default: ""
         type: string
+      live_repeat:
+        description: "Live timing: copies of each of the five photos per run (40 = 200 photos)"
+        required: false
+        default: "40"
+        type: string
       live_timing:
         description: "Also time the live cropping view on vs off (off / plain / on, the five photos x40 in the real app, on the processor; three runners, ~2 h)"
         required: false
@@ -773,13 +778,13 @@ jobs:
         env:
           CROPDOG_TEST_EMAIL: ${{ vars.CROPDOG_TEST_EMAIL }}
           CROPDOG_TEST_PASSWORD: ${{ secrets.CROPDOG_TEST_PASSWORD }}
-          CROPDOG_TEST_MACHINE_ID: "1ec0000000000002"
+          CROPDOG_TEST_MACHINE_ID: "1ec0000000000001"   # the Mac harness's too: one test computer, no takeovers
           CROPDOG_TEST_DEVICE_NAME: "Live timing (Windows builder)"
         run: |
           $ErrorActionPreference = "Stop"
           Expand-Archive -Path "new/CropDog-${{ inputs.version }}-win-x64.zip" -DestinationPath app -Force
           $exe = (Get-ChildItem -Path app -Recurse -Filter CropDog.exe | Select-Object -First 1).FullName
-          node desktop/scripts/live-timing.mjs --app $exe --photos photos --repeat 40 --runs ${{ matrix.runs }} --out live-timing.json 2>&1 | Tee-Object -Variable out
+          node desktop/scripts/live-timing.mjs --app $exe --photos photos --repeat ${{ inputs.live_repeat || '40' }} --runs ${{ matrix.runs }} --out live-timing.json 2>&1 | Tee-Object -Variable out
           $rc = $LASTEXITCODE
           Remove-Item -Recurse -Force photos -ErrorAction SilentlyContinue
           "live view timing, block ${{ matrix.block }} (Windows, processor, 200 photos per run):" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
