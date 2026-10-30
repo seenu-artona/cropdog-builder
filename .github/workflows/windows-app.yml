@@ -90,7 +90,7 @@ on:
         default: ""
         type: string
       live_timing:
-        description: "Also time the live cropping view on vs off (the five photos x40 in the real app, on the processor; ~2 h)"
+        description: "Also time the live cropping view on vs off (the five photos x40 in the real app, on the processor; ~3.5 h)"
         required: false
         default: false
         type: boolean
@@ -765,9 +765,9 @@ jobs:
           $ErrorActionPreference = "Stop"
           Expand-Archive -Path "new/CropDog-${{ inputs.version }}-win-x64.zip" -DestinationPath app -Force
           $exe = (Get-ChildItem -Path app -Recurse -Filter CropDog.exe | Select-Object -First 1).FullName
-          node desktop/scripts/live-timing.mjs --app $exe --photos photos --repeat 40 --runs warm,on,off,off,on --out live-timing.json 2>&1 | Tee-Object -Variable out
+          node desktop/scripts/live-timing.mjs --app $exe --photos photos --repeat 40 --runs warm,on,off,off,on,on,off --out live-timing.json 2>&1 | Tee-Object -Variable out
           $rc = $LASTEXITCODE
           Remove-Item -Recurse -Force photos -ErrorAction SilentlyContinue
           "live view timing (Windows, processor, 200 photos per run):" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          ($out | Where-Object { $_ -match '(photos in|ON .* OFF|WINDOW WAS HIDDEN|timed out|Error)' }) | ForEach-Object { "    $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          ($out | Where-Object { $_ -match '(photos in|ON .* OFF|previews|NO PHOTO|WINDOW WAS HIDDEN|timed out|Error)' }) | ForEach-Object { "    $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           exit $rc
